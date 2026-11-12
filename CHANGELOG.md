@@ -22,6 +22,16 @@ All versions prior to 0.9.0 are untracked.
   ([#1970](https://github.com/sigstore/sigstore-python/pull/1970))
   ([#1973](https://github.com/sigstore/sigstore-python/pull/1973))
 
+### Fixed
+
+* Enforce the RFC3161 signed timestamp count (32) and duplicate-identity
+  budget while parsing a bundle, before any timestamp response is decoded.
+  Previously an oversized bundle forced the client to decode every timestamp
+  (and duplicates could inflate the entry count) before the verifier's limits
+  applied, allowing resource exhaustion before signature verification.
+  Over-limit and duplicate timestamps now fail with a stable `InvalidBundle`
+  error at both the bundle parsing and offline verification entry points.
+
 
 ## [4.5.1]
 

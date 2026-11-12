@@ -26,7 +26,7 @@ from sigstore_models.trustroot import v1 as trustroot_v1
 from sigstore._internal.trust import CertificateAuthority
 from sigstore.dsse import StatementBuilder, Subject
 from sigstore.errors import CertValidationError, VerificationError
-from sigstore.models import Bundle, TrustedRoot
+from sigstore.models import Bundle, InvalidBundle, TrustedRoot
 from sigstore.verify import policy
 from sigstore.verify.verifier import Verifier
 
@@ -329,23 +329,44 @@ class TestVerifierWithTimestamp:
                 null_policy,
             )
 
-    def test_verifier_too_many_timestamp(self, verifier, asset, null_policy):
-        with pytest.raises(VerificationError, match="too many"):
-            verifier.verify_artifact(
-                asset("tsa/bundle.txt").read_bytes(),
-                Bundle.from_json(
-                    asset("tsa/bundle.many_timestamp.sigstore").read_bytes()
-                ),
-                null_policy,
-            )
+    def test_verifier_too_many_timestamp(self, asset):
+        # The budget is enforced while parsing the bundle, before any
+        # signature verification takes place.
+        with pytest.raises(InvalidBundle, match="too many signed timestamps"):
+            Bundle.from_json(asset("tsa/bundle.many_timestamp.sigstore").read_bytes())
 
-    def test_verifier_duplicate_timestamp(self, verifier, asset, null_policy):
-        with pytest.raises(VerificationError, match="duplicate"):
-            verifier.verify_artifact(
-                asset("tsa/bundle.txt").read_bytes(),
-                Bundle.from_json(asset("tsa/bundle.duplicate.sigstore").read_bytes()),
-                null_policy,
-            )
+    def test_verifier_duplicate_timestamp(self, asset):
+        with pytest.raises(InvalidBundle, match="duplicate signed timestamp"):
+            Bundle.from_json(asset("tsa/bundle.duplicate.sigstore").read_bytes())
+
+    def test_verifier_timestamp_budget_defense_in_depth(
+        self, verifier, asset, monkeypatch
+    ):
+        # The verifier entry point enforces the same budget, even if a bundle
+        # somehow reaches it without going through the parse-time checks.
+        bundle = Bundle.from_json(asset("tsa/bundle.txt.sigstore").read_bytes())
+        data = bundle.verification_material.timestamp_verification_data
+        valid_response = data.rfc3161_timestamps[0]
+
+        too_many = pretend.stub(rfc3161_timestamps=[valid_response] * 33)
+        monkeypatch.setattr(
+            type(bundle.verification_material),
+            "timestamp_verification_data",
+            property(lambda self: too_many),
+        )
+
+        with pytest.raises(InvalidBundle, match="too many signed timestamps"):
+            verifier._verify_timestamp_authority(bundle)
+
+        duplicates = pretend.stub(rfc3161_timestamps=[valid_response, valid_response])
+        monkeypatch.setattr(
+            type(bundle.verification_material),
+            "timestamp_verification_data",
+            property(lambda self: duplicates),
+        )
+
+        with pytest.raises(InvalidBundle, match="duplicate signed timestamp"):
+            verifier._verify_timestamp_authority(bundle)
 
     def test_verifier_outside_validity_range(
         self, caplog, verifier, asset, null_policy, monkeypatch

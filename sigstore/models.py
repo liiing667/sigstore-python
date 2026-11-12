@@ -71,6 +71,13 @@ TSA_VERSIONS = [1]
 FULCIO_VERSIONS = [1]
 OIDC_VERSIONS = [1]
 
+# Limit the number of RFC3161 signed timestamps that a bundle may contain.
+# Enforcing this at parse time prevents a malicious bundle from exhausting
+# resources by forcing the decoding of a large number of timestamp responses
+# before any signature verification takes place.
+# From https://github.com/sigstore/sigstore-go/blob/e92142f0734064ebf6001f188b7330a1212245fe/pkg/verify/tsa.go#L29
+MAX_ALLOWED_TIMESTAMPS: int = 32
+
 
 _logger = logging.getLogger(__name__)
 
@@ -261,6 +268,11 @@ class TimestampVerificationData:
         if not (timestamps := self._inner.rfc3161_timestamps):
             timestamps = []
 
+        # Enforce the count and duplicate-identity budget before decoding any
+        # timestamp response, so that an oversized bundle cannot consume
+        # resources during parsing (i.e. before any signature verification).
+        _enforce_timestamp_budget(timestamps)
+
         try:
             self._signed_ts = [
                 decode_timestamp_response(ts.signed_timestamp) for ts in timestamps
@@ -344,6 +356,35 @@ class IncompatibleEntry(InvalidBundle):
         )
 
 
+def _enforce_timestamp_budget(
+    timestamps: Iterable[RFC3161SignedTimestamp],
+) -> None:
+    """
+    Enforce the count and duplicate-identity budget for RFC3161 signed
+    timestamps, without decoding any timestamp response.
+
+    This is shared by the bundle parsing entry point and the
+    `TimestampVerificationData` wrapper so that an oversized or duplicated
+    timestamp set is rejected with a stable error before any resource
+    intensive decoding takes place.
+    """
+    timestamps = list(timestamps)
+
+    if len(timestamps) > MAX_ALLOWED_TIMESTAMPS:
+        raise InvalidBundle(
+            f"too many signed timestamps: {len(timestamps)} > {MAX_ALLOWED_TIMESTAMPS}"
+        )
+
+    # The raw DER bytes are the canonical identity of each TSA response;
+    # comparing them lets us reject duplicate responses without paying the
+    # cost of decoding them first.
+    seen_timestamps: set[bytes] = set()
+    for timestamp in timestamps:
+        if timestamp.signed_timestamp in seen_timestamps:
+            raise InvalidBundle("duplicate signed timestamp found")
+        seen_timestamps.add(timestamp.signed_timestamp)
+
+
 class Bundle:
     """
     Represents a Sigstore bundle.
@@ -388,6 +429,15 @@ class Bundle:
             media_type = Bundle.BundleType(self._inner.media_type)
         except ValueError:
             raise InvalidBundle(f"unsupported bundle format: {self._inner.media_type}")
+
+        # Enforce the RFC3161 signed timestamp count and duplicate-identity
+        # budget before any further parsing or signature verification, so that
+        # a malicious oversized bundle cannot consume resources up front.
+        timestamp_verification_data = (
+            self._inner.verification_material.timestamp_verification_data
+        )
+        if timestamp_verification_data is not None:
+            _enforce_timestamp_budget(timestamp_verification_data.rfc3161_timestamps)
 
         # Extract the signing certificate.
         if media_type in (

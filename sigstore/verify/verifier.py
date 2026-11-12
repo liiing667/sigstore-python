@@ -61,14 +61,16 @@ from sigstore._internal.trust import KeyringPurpose
 from sigstore._utils import base64_encode_pem_cert, sha256_digest
 from sigstore.errors import CertValidationError, VerificationError
 from sigstore.hashes import Hashed
-from sigstore.models import Bundle, ClientTrustConfig, TrustedRoot
+from sigstore.models import (
+    MAX_ALLOWED_TIMESTAMPS,
+    Bundle,
+    ClientTrustConfig,
+    InvalidBundle,
+    TrustedRoot,
+)
 from sigstore.verify.policy import VerificationPolicy
 
 _logger = logging.getLogger(__name__)
-
-# Limit the number of timestamps to prevent DoS
-# From https://github.com/sigstore/sigstore-go/blob/e92142f0734064ebf6001f188b7330a1212245fe/pkg/verify/tsa.go#L29
-MAX_ALLOWED_TIMESTAMP: int = 32
 
 # When verifying an entry, this threshold represents the minimum number of required
 # verified times to consider a signature valid.
@@ -191,13 +193,18 @@ class Verifier:
         ):
             timestamp_responses = timestamp_verification_data.rfc3161_timestamps
 
-        if len(timestamp_responses) > MAX_ALLOWED_TIMESTAMP:
-            msg = f"too many signed timestamp: {len(timestamp_responses)} > {MAX_ALLOWED_TIMESTAMP}"
-            raise VerificationError(msg)
+        # Defense in depth: the same budget is already enforced while parsing
+        # the bundle, before any timestamp response is decoded.
+        if len(timestamp_responses) > MAX_ALLOWED_TIMESTAMPS:
+            raise InvalidBundle(
+                f"too many signed timestamps: {len(timestamp_responses)} > "
+                f"{MAX_ALLOWED_TIMESTAMPS}"
+            )
 
-        if len(set(timestamp_responses)) != len(timestamp_responses):
-            msg = "duplicate timestamp found"
-            raise VerificationError(msg)
+        if len({response.as_bytes() for response in timestamp_responses}) != len(
+            timestamp_responses
+        ):
+            raise InvalidBundle("duplicate signed timestamp found")
 
         verified_timestamps = [
             result

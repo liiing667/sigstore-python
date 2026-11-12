@@ -21,12 +21,19 @@ from sigstore_models.rekor.v1 import TransparencyLogEntry as _TransparencyLogEnt
 
 from sigstore.errors import VerificationError
 from sigstore.models import (
+    MAX_ALLOWED_TIMESTAMPS,
     Bundle,
     InvalidBundle,
     TimestampVerificationData,
     TransparencyLogEntry,
     VerificationMaterial,
 )
+
+
+def _timestamp_entry(signed_timestamp: str | bytes) -> dict:
+    if isinstance(signed_timestamp, bytes):
+        signed_timestamp = b64encode(signed_timestamp).decode()
+    return {"signedTimestamp": signed_timestamp}
 
 
 class TestTransparencyLogEntry:
@@ -106,6 +113,99 @@ class TestTimestampVerificationData:
         with pytest.raises(VerificationError, match="Invalid Timestamp"):
             TimestampVerificationData.from_json(json.dumps(timestamp))
 
+    def test_too_many_timestamps(self, asset):
+        bundle = json.loads(asset("tsa/bundle.txt.sigstore").read_bytes())
+        valid_entry = bundle["verificationMaterial"]["timestampVerificationData"][
+            "rfc3161Timestamps"
+        ][0]
+        timestamp = {
+            "rfc3161Timestamps": [
+                dict(valid_entry) for _ in range(MAX_ALLOWED_TIMESTAMPS + 1)
+            ]
+        }
+
+        with pytest.raises(InvalidBundle, match="too many signed timestamps"):
+            TimestampVerificationData.from_json(json.dumps(timestamp))
+
+    def test_too_many_timestamps_does_not_decode(self, asset, monkeypatch):
+        # The budget must be enforced before any RFC3161 response is decoded,
+        # otherwise an oversized bundle would consume resources during parsing.
+        def fail_decode(*args, **kwargs):
+            raise AssertionError("timestamp responses must not be decoded")
+
+        monkeypatch.setattr(
+            "sigstore.models.decode_timestamp_response",
+            fail_decode,
+        )
+
+        bundle = json.loads(asset("tsa/bundle.txt.sigstore").read_bytes())
+        valid_entry = bundle["verificationMaterial"]["timestampVerificationData"][
+            "rfc3161Timestamps"
+        ][0]
+        timestamp = {
+            "rfc3161Timestamps": [
+                dict(valid_entry) for _ in range(MAX_ALLOWED_TIMESTAMPS + 1)
+            ]
+        }
+
+        with pytest.raises(InvalidBundle, match="too many signed timestamps"):
+            TimestampVerificationData.from_json(json.dumps(timestamp))
+
+    def test_duplicate_timestamps(self, asset):
+        bundle = json.loads(asset("tsa/bundle.txt.sigstore").read_bytes())
+        valid_entry = bundle["verificationMaterial"]["timestampVerificationData"][
+            "rfc3161Timestamps"
+        ][0]
+        timestamp = {"rfc3161Timestamps": [dict(valid_entry), dict(valid_entry)]}
+
+        with pytest.raises(InvalidBundle, match="duplicate signed timestamp"):
+            TimestampVerificationData.from_json(json.dumps(timestamp))
+
+    def test_duplicate_timestamps_does_not_decode(self, asset, monkeypatch):
+        def fail_decode(*args, **kwargs):
+            raise AssertionError("timestamp responses must not be decoded")
+
+        monkeypatch.setattr(
+            "sigstore.models.decode_timestamp_response",
+            fail_decode,
+        )
+
+        bundle = json.loads(asset("tsa/bundle.txt.sigstore").read_bytes())
+        valid_entry = bundle["verificationMaterial"]["timestampVerificationData"][
+            "rfc3161Timestamps"
+        ][0]
+        timestamp = {"rfc3161Timestamps": [dict(valid_entry), dict(valid_entry)]}
+
+        with pytest.raises(InvalidBundle, match="duplicate signed timestamp"):
+            TimestampVerificationData.from_json(json.dumps(timestamp))
+
+    def test_at_limit_passes_budget_check(self):
+        # Exactly MAX_ALLOWED_TIMESTAMPS distinct entries must not trip the
+        # count or duplicate budget; the entries themselves are intentionally
+        # undecodable so that only the budget logic is asserted.
+        timestamp = {
+            "rfc3161Timestamps": [
+                _timestamp_entry(f"distinct-entry-{index}".encode())
+                for index in range(MAX_ALLOWED_TIMESTAMPS)
+            ]
+        }
+
+        with pytest.raises(VerificationError, match="Invalid Timestamp"):
+            TimestampVerificationData.from_json(json.dumps(timestamp))
+
+    def test_over_limit_with_distinct_entries(self):
+        # Distinct identities at MAX_ALLOWED_TIMESTAMPS + 1 still trip the
+        # count budget without any decoding.
+        timestamp = {
+            "rfc3161Timestamps": [
+                _timestamp_entry(f"distinct-entry-{index}".encode())
+                for index in range(MAX_ALLOWED_TIMESTAMPS + 1)
+            ]
+        }
+
+        with pytest.raises(InvalidBundle, match="too many signed timestamps"):
+            TimestampVerificationData.from_json(json.dumps(timestamp))
+
 
 class TestVerificationMaterial:
     """
@@ -163,6 +263,16 @@ class TestBundle:
             match=r"bundle must contain an inclusion promise or signed timestamp\(s\)",
         ):
             signing_bundle("bundle_v3_no_signed_time.txt")
+
+    def test_bundle_too_many_timestamps(self, asset):
+        # The RFC3161 timestamp budget is enforced while parsing the bundle,
+        # before any signature verification happens.
+        with pytest.raises(InvalidBundle, match="too many signed timestamps"):
+            Bundle.from_json(asset("tsa/bundle.many_timestamp.sigstore").read_bytes())
+
+    def test_bundle_duplicate_timestamps(self, asset):
+        with pytest.raises(InvalidBundle, match="duplicate signed timestamp"):
+            Bundle.from_json(asset("tsa/bundle.duplicate.sigstore").read_bytes())
 
 
 class TestKnownBundleTypes:
